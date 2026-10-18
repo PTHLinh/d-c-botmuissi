@@ -1,0 +1,287 @@
+const { LoggerFactory } = require("./logger.js");
+const { useHooks } = require("zihooks");
+const { GatewayIntentBits, Client, Collection } = require("discord.js");
+const { Hono } = require("hono");
+const { createServer } = require("node:http");
+const { getRequestListener } = require("@hono/node-server");
+const WebSocket = require("ws");
+const zzicon = require("./../utility/icon.js");
+const { Loader } = require("@ziji/loader");
+
+const createWebApp = () => {
+	const app = new Hono();
+	const allowedOrigins = getAllowedOrigins();
+
+	app.use("*", async (context, next) => {
+		const requestOrigin = context.req.header("origin");
+		const originAllowed =
+			allowedOrigins === "*" ||
+			(Array.isArray(allowedOrigins) ? allowedOrigins.includes(requestOrigin) : allowedOrigins === requestOrigin);
+
+		if (originAllowed) context.header("Access-Control-Allow-Origin", allowedOrigins === "*" ? "*" : requestOrigin);
+		if (Array.isArray(allowedOrigins)) context.header("Vary", "Origin", { append: true });
+		context.header("Access-Control-Allow-Credentials", "true");
+
+		if (context.req.method === "OPTIONS") {
+			context.header("Access-Control-Allow-Origin", requestOrigin || "*");
+			context.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+			context.header(
+				"Access-Control-Allow-Headers",
+				context.req.header("Access-Control-Request-Headers") || "Content-Type, Authorization",
+			);
+			return context.body(null, 204);
+		}
+
+		await next();
+	});
+	app.use("*", async (context, next) => {
+		if (context.req.header("content-type")?.includes("application/json")) {
+			try {
+				const body = await context.req.json();
+				if (body === null || typeof body !== "object") return context.text("Invalid JSON", 400);
+				context.set("body", body);
+			} catch {
+				return context.text("Invalid JSON", 400);
+			}
+		}
+		await next();
+	});
+
+	return app;
+};
+
+class StartupManager {
+	constructor(client) {
+		this.client = client;
+		this.config = this.initConfig();
+		this.logger = LoggerFactory.create(this.config);
+		this.createFile("./jsons");
+		this.web = this.initWeb();
+		this.initPlayerNet();
+		this.loaders = [];
+	}
+
+	initConfig() {
+		try {
+			this.config = require("../config");
+		} catch {
+			console.warn("No config file found, using default configuration.");
+			this.config = require("./defaultconfig");
+		}
+
+		useHooks.set("config", this.config);
+		return this.config;
+	}
+
+	initWeb() {
+		this.logger.debug?.("Starting web...");
+		const app = createWebApp();
+		const server = createServer(getRequestListener(app.fetch));
+		const wss = new WebSocket.Server({ noServer: true });
+		const streamWss = new WebSocket.Server({ noServer: true, maxPayload: 1024 * 1024 + 16 });
+
+		server.on("upgrade", (request, socket, head) => {
+			let pathname;
+			try {
+				pathname = new URL(request.url, "http://localhost").pathname;
+			} catch {
+				socket.destroy();
+				return;
+			}
+
+			const target =
+				pathname === "/ws" ? wss
+				: pathname === "/ws/stream" ? streamWss
+				: null;
+			if (!target) {
+				socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+				return;
+			}
+			target.handleUpgrade(request, socket, head, (webSocket) => target.emit("connection", webSocket, request));
+		});
+
+		server.listen(process.env.SERVER_PORT || 2003, () => {
+			this.logger.info(`Server running on port ${process.env.SERVER_PORT || 2003}`);
+		});
+
+		return { server: app, httpServer: server, wss, streamWss };
+	}
+
+	initPlayerNet() {
+		if (!process.env.MULTI_PLAYER_TOKEN) {
+			useHooks.set("playerNetClient", [this.client]);
+			return;
+		}
+
+		const playerNetTOKENs = process.env.MULTI_PLAYER_TOKEN.split(",");
+		const playerNetClient = [this.client];
+		try {
+			playerNetTOKENs.forEach((TOKEN) => {
+				const PlayerClient = new Client({
+					intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+				});
+				try {
+					PlayerClient.login(TOKEN.trim());
+					PlayerClient.once("ready", (cle) => {
+						this.logger.info(`Connected to ${cle?.user?.displayName}`);
+						playerNetClient.push(PlayerClient);
+					});
+				} catch (error) {
+					this.logger.warn(`Failed to login with token: ${TOKEN.trim().slice(0, 22)}...`);
+					this.logger.warn(error);
+				}
+			});
+		} catch (e) {
+			this.logger.warn("Create bot PlayerNet Fall:");
+			this.logger.warn(e);
+		} finally {
+			useHooks.set("playerNetClient", playerNetClient);
+		}
+	}
+
+	getConfig() {
+		return this.config;
+	}
+
+	getLogger() {
+		return this.logger;
+	}
+
+	createFile(directory) {
+		const fs = require("node:fs");
+		if (!fs.existsSync(directory)) fs.mkdirSync(directory, { recursive: true });
+	}
+
+	async loadModules(directory, collection) {
+		const loader = new Loader({
+			recursive: true,
+			watch: process.env.NODE_ENV === "development",
+			debounce: 150,
+			throwOnError: false,
+			debug: this.config.DevConfig?.loaderDebug ?? false,
+			check(module) {
+				return !!module && typeof module === "object" && "data" in module && typeof module.execute === "function";
+			},
+			init(module, ctx) {
+				const config = useHooks.get("config");
+				const disabled = config?.disabledCommands?.includes(module?.data?.name) || module?.data?.enable === false;
+				if (disabled) return;
+
+				if (collection) collection.set(module.data.name, module);
+				const messageCommands = useHooks.get("Mcommands");
+				const aliases = Array.isArray(module.data?.alias) ? module.data.alias : [];
+
+				if (messageCommands) {
+					messageCommands.set(module.data.name, module);
+					for (const alias of aliases) {
+						if (!messageCommands.has(alias)) messageCommands.set(alias, module);
+					}
+				}
+
+				ctx.signal.addEventListener(
+					"abort",
+					() => {
+						if (collection?.get(module.data.name) === module) collection.delete(module.data.name);
+						if (!messageCommands) return;
+						if (messageCommands.get(module.data.name) === module) messageCommands.delete(module.data.name);
+						for (const alias of aliases) {
+							if (messageCommands.get(alias) === module) messageCommands.delete(alias);
+						}
+					},
+					{ once: true },
+				);
+			},
+		});
+		const result = await loader.load(directory);
+		this.loaders.push({ loader, result });
+		for (const failure of result.failed) this.logger.error(`Failed to load ${failure.path}:`, failure.error);
+		this.logger.debug?.(`Loaded ${result.loaded.length} modules from ${directory}`);
+		return result;
+	}
+
+	async loadEvents(directory, target) {
+		const loader = new Loader({
+			recursive: true,
+			watch: process.env.NODE_ENV === "development",
+			debounce: 150,
+			throwOnError: false,
+			debug: this.config.DevConfig?.loaderDebug ?? false,
+
+			check(module) {
+				return !!module && typeof module === "object" && typeof module.name === "string" && typeof module.execute === "function";
+			},
+			init(module, ctx) {
+				if (module.enable === false) return;
+				const handler = async (...args) => {
+					try {
+						await module.execute(...args);
+					} catch (error) {
+						const logger = useHooks.get("logger");
+						logger.error(`Error executing event ${module.name}:`, error);
+					}
+				};
+				if (module.once) target.once(module.name, handler);
+				else target.on(module.name, handler);
+				ctx.signal.addEventListener(
+					"abort",
+					() => {
+						target.off(module.name, handler);
+					},
+					{ once: true },
+				);
+			},
+		});
+		const result = await loader.load(directory);
+		this.loaders.push({ loader, result });
+		for (const failure of result.failed) this.logger.error(`Failed to load event ${failure.path}:`, failure.error);
+		this.logger.debug?.(`Loaded ${result.loaded.length} events from ${directory}`);
+		return result;
+	}
+
+	async loadExtensions() {
+		for (let priority = 1; priority <= 10; priority++) {
+			await Promise.all(
+				useHooks.get("extensions").map(async (extension) => {
+					extension.data.priority = extension.data?.priority ?? 10;
+					if (extension.data.enable && extension.data.priority === priority && typeof extension.execute === "function") {
+						this.logger?.debug?.(`Loaded extension: ${extension.data.name} (priority: ${priority})`);
+						return await extension.execute(this.client);
+					}
+				}),
+			).catch((error) => {
+				console.log(error);
+				this.logger.debug("Error loading extensions with priority", priority, ":", error);
+			});
+		}
+	}
+
+	initHooks() {
+		useHooks.set("config", this.config);
+		useHooks.set("client", this.client);
+		useHooks.set("welcome", new Collection());
+		useHooks.set("cooldowns", new Collection());
+		useHooks.set("responder", new Collection());
+		useHooks.set("temp", new Collection());
+		useHooks.set("commands", new Collection());
+		useHooks.set("Mcommands", new Collection());
+		useHooks.set("functions", new Collection());
+		useHooks.set("extensions", new Collection());
+		useHooks.set("guildCommands", new Collection());
+		useHooks.set("logger", this.logger);
+		useHooks.set("wss", this.web.wss);
+		useHooks.set("streamWss", this.web.streamWss);
+		useHooks.set("server", this.web.server);
+		useHooks.set("httpServer", this.web.httpServer);
+		useHooks.set("icon", zzicon);
+		useHooks.set("loaders", this.loaders);
+	}
+}
+
+const getAllowedOrigins = () => {
+	const raw = process.env.CORS_ORIGIN;
+	if (!raw || raw === "*") return "*";
+	if (raw.includes(",")) return raw.split(",").map((origin) => origin.trim());
+	return raw;
+};
+
+module.exports = { StartupManager, createWebApp };

@@ -1,0 +1,16 @@
+const { useHooks } = require("zihooks");
+
+module.exports = {
+	name: "queueEnd",
+	type: "Player",
+	/**
+	 *
+	 * @param {import('ziplayer').Player} player
+	 */
+	execute: async (player) => {
+		const playerGui = useHooks.get("functions").get("playerGui");
+		if (!playerGui) return;
+		const res = await playerGui.execute({ player });
+		if (player.userdata.mess) return player.userdata.mess.edit(res).catch((e) => {});
+	},
+};
